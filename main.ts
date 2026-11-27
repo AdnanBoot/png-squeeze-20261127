@@ -1,6 +1,7 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync, inflateSync } from 'node:zlib';
+import { zopfliDeflateZlib } from './deflate.ts';
 
 const PNG_SIGNATURE = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
 const CHANNELS: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
@@ -203,41 +204,112 @@ function reduceColourType(rgba: Uint8Array, width: number, height: number): Redu
 
   // <= 256 distinct RGBA colours -> type 3 (palette)
   if (!tooManyColors) {
-    const entries = Array.from(colorMap.keys());
-    // Put non-opaque entries first so tRNS is minimal; sort opaque entries by luminance/appearance
-    entries.sort((a, b) => {
-      const aa = a & 0xff;
-      const ba = b & 0xff;
-      if ((aa < 255) !== (ba < 255)) return aa < 255 ? -1 : 1;
-      return a - b;
-    });
-
-    const sortedMap = new Map<number, number>();
-    const plte = new Uint8Array(entries.length * 3);
-    let trnsLen = 0;
-    for (let i = 0; i < entries.length; i++) {
-      const c = entries[i];
-      sortedMap.set(c, i);
-      plte[i * 3] = (c >>> 24) & 0xff;
-      plte[i * 3 + 1] = (c >>> 16) & 0xff;
-      plte[i * 3 + 2] = (c >>> 8) & 0xff;
-      if ((c & 0xff) < 255) trnsLen = i + 1;
-    }
-
-    let trns: Uint8Array | null = null;
-    if (trnsLen > 0) {
-      trns = new Uint8Array(trnsLen);
-      for (let i = 0; i < trnsLen; i++) {
-        trns[i] = entries[i] & 0xff;
-      }
-    }
-
-    const samples = new Uint8Array(n);
+    const baseEntries = Array.from(colorMap.keys());
+    const freqs = new Map<number, number>();
     for (let i = 0, p = 0; i < n; i++, p += 4) {
       const key = ((rgba[p] << 24) | (rgba[p + 1] << 16) | (rgba[p + 2] << 8) | rgba[p + 3]) >>> 0;
-      samples[i] = sortedMap.get(key)!;
+      freqs.set(key, (freqs.get(key) ?? 0) + 1);
     }
-    return { colourType: 3, bpp: 1, samples, plte, trns };
+
+    const buildPaletteCandidate = (sortMode: 'appearance' | 'luminance' | 'frequency' | 'rgb' | 'nearest'): ReducedImage => {
+      let entries = baseEntries.slice();
+      if (sortMode === 'nearest') {
+        const trans: number[] = [];
+        const opq: number[] = [];
+        for (const c of entries) {
+          if ((c & 0xff) < 255) trans.push(c);
+          else opq.push(c);
+        }
+        trans.sort((a, b) => a - b);
+        const ordered: number[] = [];
+        if (opq.length > 0) {
+          opq.sort((a, b) => (freqs.get(b)! - freqs.get(a)!) || (a - b));
+          const used = new Uint8Array(opq.length);
+          let cur = opq[0];
+          used[0] = 1;
+          ordered.push(cur);
+          for (let step = 1; step < opq.length; step++) {
+            const cr = (cur >>> 24) & 0xff;
+            const cg = (cur >>> 16) & 0xff;
+            const cb = (cur >>> 8) & 0xff;
+            let bestIdx = -1;
+            let bestDist = Infinity;
+            for (let j = 0; j < opq.length; j++) {
+              if (used[j]) continue;
+              const o = opq[j];
+              const dr = ((o >>> 24) & 0xff) - cr;
+              const dg = ((o >>> 16) & 0xff) - cg;
+              const db = ((o >>> 8) & 0xff) - cb;
+              const d = dr * dr + dg * dg + db * db;
+              if (d < bestDist) {
+                bestDist = d;
+                bestIdx = j;
+              }
+            }
+            used[bestIdx] = 1;
+            cur = opq[bestIdx];
+            ordered.push(cur);
+          }
+        }
+        entries = trans.concat(ordered);
+      } else {
+        entries.sort((a, b) => {
+          const aa = a & 0xff;
+          const ba = b & 0xff;
+          if ((aa < 255) !== (ba < 255)) return aa < 255 ? -1 : 1;
+          if (sortMode === 'appearance') return (colorMap.get(a)! - colorMap.get(b)!);
+          if (sortMode === 'frequency') return (freqs.get(b)! - freqs.get(a)!) || (a - b);
+          if (sortMode === 'rgb') return a - b;
+          const la = 299 * ((a >>> 24) & 0xff) + 587 * ((a >>> 16) & 0xff) + 114 * ((a >>> 8) & 0xff);
+          const lb = 299 * ((b >>> 24) & 0xff) + 587 * ((b >>> 16) & 0xff) + 114 * ((b >>> 8) & 0xff);
+          return la - lb || a - b;
+        });
+      }
+
+      const sortedMap = new Map<number, number>();
+      const plte = new Uint8Array(entries.length * 3);
+      let trnsLen = 0;
+      for (let i = 0; i < entries.length; i++) {
+        const c = entries[i];
+        sortedMap.set(c, i);
+        plte[i * 3] = (c >>> 24) & 0xff;
+        plte[i * 3 + 1] = (c >>> 16) & 0xff;
+        plte[i * 3 + 2] = (c >>> 8) & 0xff;
+        if ((c & 0xff) < 255) trnsLen = i + 1;
+      }
+
+      let trns: Uint8Array | null = null;
+      if (trnsLen > 0) {
+        trns = new Uint8Array(trnsLen);
+        for (let i = 0; i < trnsLen; i++) {
+          trns[i] = entries[i] & 0xff;
+        }
+      }
+
+      const samples = new Uint8Array(n);
+      for (let i = 0, p = 0; i < n; i++, p += 4) {
+        const key = ((rgba[p] << 24) | (rgba[p + 1] << 16) | (rgba[p + 2] << 8) | rgba[p + 3]) >>> 0;
+        samples[i] = sortedMap.get(key)!;
+      }
+      return { colourType: 3, bpp: 1, samples, plte, trns };
+    };
+
+    let bestCand: ReducedImage | null = null;
+    let bestCandSize = Infinity;
+    for (const sm of ['appearance', 'luminance', 'frequency', 'rgb', 'nearest'] as const) {
+      const cand = buildPaletteCandidate(sm);
+      const stride = width;
+      const raw = new Uint8Array(height * (stride + 1));
+      for (let y = 0; y < height; y++) {
+        raw.set(cand.samples.subarray(y * stride, (y + 1) * stride), y * (stride + 1) + 1);
+      }
+      const z = deflateSync(raw, { level: 6, memLevel: 9 });
+      if (z.length < bestCandSize) {
+        bestCandSize = z.length;
+        bestCand = cand;
+      }
+    }
+    return bestCand!;
   }
 
   // Grey + alpha -> type 4
@@ -353,35 +425,159 @@ function filterRow(
   return sum;
 }
 
-function filterImage(samples: Uint8Array, width: number, height: number, bpp: number): Uint8Array {
+function rowEntropyCost(buf: Uint8Array, counts: Int32Array): number {
+  counts.fill(0);
+  const n = buf.length;
+  for (let i = 0; i < n; i++) counts[buf[i]]++;
+  let cost = 0;
+  for (let i = 0; i < 256; i++) {
+    const c = counts[i];
+    if (c > 0) cost -= c * Math.log2(c / n);
+  }
+  return cost;
+}
+
+function rowCrossEntropyCost(buf: Uint8Array, globalCounts: Int32Array, globalTotal: number): number {
+  const n = buf.length;
+  const denom = globalTotal + n + 256;
+  let cost = 0;
+  for (let i = 0; i < n; i++) {
+    cost -= Math.log2((globalCounts[buf[i]] + 1) / denom);
+  }
+  return cost;
+}
+
+function filterImage(
+  samples: Uint8Array,
+  width: number,
+  height: number,
+  bpp: number,
+  mode: 'none' | 'sub' | 'up' | 'avg' | 'paeth' | 'minsum' | 'entropy' | 'xentropy' | 'strip16'
+): Uint8Array {
   const stride = width * bpp;
   const raw = new Uint8Array(height * (stride + 1));
+
+  if (mode === 'none' || mode === 'sub' || mode === 'up' || mode === 'avg' || mode === 'paeth') {
+    const ft = mode === 'none' ? 0 : mode === 'sub' ? 1 : mode === 'up' ? 2 : mode === 'avg' ? 3 : 4;
+    for (let y = 0; y < height; y++) {
+      const cur = samples.subarray(y * stride, (y + 1) * stride);
+      const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+      const dst = y * (stride + 1);
+      raw[dst] = ft;
+      filterRow(ft, cur, prev, bpp, raw.subarray(dst + 1, dst + 1 + stride));
+    }
+    return raw;
+  }
+
+  if (mode === 'strip16') {
+    const stripBuf = Array.from({ length: 5 }, () => new Uint8Array(stride));
+    for (let y0 = 0; y0 < height; y0 += 16) {
+      const y1 = Math.min(height, y0 + 16);
+      let bestType = 0;
+      let bestSum = Infinity;
+      for (let t = 0; t < 5; t++) {
+        let s = 0;
+        for (let y = y0; y < y1; y++) {
+          const cur = samples.subarray(y * stride, (y + 1) * stride);
+          const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+          s += filterRow(t, cur, prev, bpp, stripBuf[t]);
+        }
+        if (s < bestSum) {
+          bestSum = s;
+          bestType = t;
+        }
+      }
+      for (let y = y0; y < y1; y++) {
+        const cur = samples.subarray(y * stride, (y + 1) * stride);
+        const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+        const dst = y * (stride + 1);
+        raw[dst] = bestType;
+        filterRow(bestType, cur, prev, bpp, raw.subarray(dst + 1, dst + 1 + stride));
+      }
+    }
+    return raw;
+  }
+
   const trials = Array.from({ length: 5 }, () => new Uint8Array(stride));
+  const counts = new Int32Array(256);
+  const globalCounts = new Int32Array(256);
+  let globalTotal = 0;
 
   for (let y = 0; y < height; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
     let bestType = 0;
-    let bestSum = Infinity;
+    let bestScore = Infinity;
     for (let t = 0; t < 5; t++) {
       const s = filterRow(t, cur, prev, bpp, trials[t]);
-      if (s < bestSum) {
-        bestSum = s;
+      const score =
+        mode === 'minsum'
+          ? s
+          : mode === 'entropy'
+            ? rowEntropyCost(trials[t], counts)
+            : rowCrossEntropyCost(trials[t], globalCounts, globalTotal);
+      if (score < bestScore) {
+        bestScore = score;
         bestType = t;
       }
     }
+    const chosen = trials[bestType];
+    if (mode === 'xentropy') {
+      for (let i = 0; i < stride; i++) globalCounts[chosen[i]]++;
+      globalTotal += stride;
+    }
     const dst = y * (stride + 1);
     raw[dst] = bestType;
-    raw.set(trials[bestType], dst + 1);
+    raw.set(chosen, dst + 1);
   }
   return raw;
 }
 
 function encodePng(rgba: Uint8Array, width: number, height: number): Uint8Array {
   const reduced = reduceColourType(rgba, width, height);
-  const raw = filterImage(reduced.samples, width, height, reduced.bpp);
-  const idat = new Uint8Array(deflateSync(raw, { level: 9, memLevel: 9 }));
-  return buildPng(width, height, reduced.colourType, reduced.plte, reduced.trns, idat);
+  const modes: Array<'none' | 'sub' | 'up' | 'avg' | 'paeth' | 'minsum' | 'entropy' | 'xentropy' | 'strip16'> =
+    reduced.colourType === 3
+      ? ['none', 'sub', 'up', 'paeth', 'minsum', 'entropy', 'xentropy']
+      : ['none', 'sub', 'up', 'paeth', 'minsum', 'entropy', 'xentropy', 'strip16'];
+
+  let bestIdat: Uint8Array | null = null;
+  let bestRaw: Uint8Array | null = null;
+  let bestPreLen = Infinity;
+  let secondRaw: Uint8Array | null = null;
+  let secondPreLen = Infinity;
+
+  for (const mode of modes) {
+    const raw = filterImage(reduced.samples, width, height, reduced.bpp, mode);
+    const z = new Uint8Array(deflateSync(raw, { level: 6, memLevel: 9, strategy: 0 }));
+    if (z.length < bestPreLen) {
+      secondPreLen = bestPreLen;
+      secondRaw = bestRaw;
+      bestPreLen = z.length;
+      bestRaw = raw;
+    } else if (z.length < secondPreLen) {
+      secondPreLen = z.length;
+      secondRaw = raw;
+    }
+  }
+  if (bestRaw !== null) {
+    for (const strategy of [0, 1]) {
+      const z = new Uint8Array(deflateSync(bestRaw, { level: 9, memLevel: 9, strategy }));
+      if (bestIdat === null || z.length < bestIdat.length) {
+        bestIdat = z;
+      }
+    }
+    const zopfli = zopfliDeflateZlib(bestRaw);
+    if (bestIdat === null || zopfli.length < bestIdat.length) {
+      bestIdat = zopfli;
+    }
+    if (secondRaw !== null && secondRaw.length <= 1_000_000 && secondPreLen <= bestPreLen * 1.02) {
+      const zopfli2 = zopfliDeflateZlib(secondRaw);
+      if (zopfli2.length < bestIdat.length) {
+        bestIdat = zopfli2;
+      }
+    }
+  }
+  return buildPng(width, height, reduced.colourType, reduced.plte, reduced.trns, bestIdat!);
 }
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
