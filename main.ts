@@ -305,13 +305,81 @@ function buildPng(
   return out;
 }
 
+function filterRow(
+  type: number,
+  cur: Uint8Array,
+  prev: Uint8Array | null,
+  bpp: number,
+  out: Uint8Array
+): number {
+  const n = cur.length;
+  let sum = 0;
+  if (type === 0) {
+    out.set(cur);
+    for (let i = 0; i < n; i++) {
+      const v = out[i];
+      sum += v < 128 ? v : 256 - v;
+    }
+  } else if (type === 1) {
+    for (let i = 0; i < n; i++) {
+      const v = (cur[i] - (i >= bpp ? cur[i - bpp] : 0)) & 0xff;
+      out[i] = v;
+      sum += v < 128 ? v : 256 - v;
+    }
+  } else if (type === 2) {
+    for (let i = 0; i < n; i++) {
+      const v = (cur[i] - (prev === null ? 0 : prev[i])) & 0xff;
+      out[i] = v;
+      sum += v < 128 ? v : 256 - v;
+    }
+  } else if (type === 3) {
+    for (let i = 0; i < n; i++) {
+      const a = i >= bpp ? cur[i - bpp] : 0;
+      const b = prev === null ? 0 : prev[i];
+      const v = (cur[i] - ((a + b) >> 1)) & 0xff;
+      out[i] = v;
+      sum += v < 128 ? v : 256 - v;
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      const a = i >= bpp ? cur[i - bpp] : 0;
+      const b = prev === null ? 0 : prev[i];
+      const c = prev !== null && i >= bpp ? prev[i - bpp] : 0;
+      const v = (cur[i] - paethPredictor(a, b, c)) & 0xff;
+      out[i] = v;
+      sum += v < 128 ? v : 256 - v;
+    }
+  }
+  return sum;
+}
+
+function filterImage(samples: Uint8Array, width: number, height: number, bpp: number): Uint8Array {
+  const stride = width * bpp;
+  const raw = new Uint8Array(height * (stride + 1));
+  const trials = Array.from({ length: 5 }, () => new Uint8Array(stride));
+
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    let bestType = 0;
+    let bestSum = Infinity;
+    for (let t = 0; t < 5; t++) {
+      const s = filterRow(t, cur, prev, bpp, trials[t]);
+      if (s < bestSum) {
+        bestSum = s;
+        bestType = t;
+      }
+    }
+    const dst = y * (stride + 1);
+    raw[dst] = bestType;
+    raw.set(trials[bestType], dst + 1);
+  }
+  return raw;
+}
+
 function encodePng(rgba: Uint8Array, width: number, height: number): Uint8Array {
   const reduced = reduceColourType(rgba, width, height);
-  const stride = width * reduced.bpp;
-  const raw = new Uint8Array(height * (stride + 1));
-  for (let y = 0; y < height; y++) {
-    raw.set(reduced.samples.subarray(y * stride, (y + 1) * stride), y * (stride + 1) + 1);
-  }
+  const raw = filterImage(reduced.samples, width, height, reduced.bpp);
   const idat = new Uint8Array(deflateSync(raw, { level: 9, memLevel: 9 }));
   return buildPng(width, height, reduced.colourType, reduced.plte, reduced.trns, idat);
 }
