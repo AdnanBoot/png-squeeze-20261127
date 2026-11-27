@@ -537,26 +537,20 @@ function encodePng(rgba: Uint8Array, width: number, height: number): Uint8Array 
   const reduced = reduceColourType(rgba, width, height);
   const modes: Array<'none' | 'sub' | 'up' | 'avg' | 'paeth' | 'minsum' | 'entropy' | 'xentropy' | 'strip16'> =
     reduced.colourType === 3
-      ? ['none', 'sub', 'up', 'paeth', 'minsum', 'entropy', 'xentropy']
-      : ['none', 'sub', 'up', 'paeth', 'minsum', 'entropy', 'xentropy', 'strip16'];
+      ? ['none', 'sub', 'up', 'paeth', 'minsum']
+      : ['none', 'sub', 'up', 'paeth', 'minsum', 'xentropy'];
 
   let bestIdat: Uint8Array | null = null;
   let bestRaw: Uint8Array | null = null;
   let bestPreLen = Infinity;
-  let secondRaw: Uint8Array | null = null;
-  let secondPreLen = Infinity;
 
+  const preLevel = reduced.colourType === 3 ? 6 : 5;
   for (const mode of modes) {
     const raw = filterImage(reduced.samples, width, height, reduced.bpp, mode);
-    const z = new Uint8Array(deflateSync(raw, { level: 6, memLevel: 9, strategy: 0 }));
+    const z = new Uint8Array(deflateSync(raw, { level: preLevel, memLevel: 9, strategy: 0 }));
     if (z.length < bestPreLen) {
-      secondPreLen = bestPreLen;
-      secondRaw = bestRaw;
       bestPreLen = z.length;
       bestRaw = raw;
-    } else if (z.length < secondPreLen) {
-      secondPreLen = z.length;
-      secondRaw = raw;
     }
   }
   if (bestRaw !== null) {
@@ -569,12 +563,6 @@ function encodePng(rgba: Uint8Array, width: number, height: number): Uint8Array 
     const zopfli = zopfliDeflateZlib(bestRaw);
     if (bestIdat === null || zopfli.length < bestIdat.length) {
       bestIdat = zopfli;
-    }
-    if (secondRaw !== null && secondRaw.length <= 1_000_000 && secondPreLen <= bestPreLen * 1.02) {
-      const zopfli2 = zopfliDeflateZlib(secondRaw);
-      if (zopfli2.length < bestIdat.length) {
-        bestIdat = zopfli2;
-      }
     }
   }
   return buildPng(width, height, reduced.colourType, reduced.plte, reduced.trns, bestIdat!);

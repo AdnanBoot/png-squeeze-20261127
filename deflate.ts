@@ -291,8 +291,6 @@ function encodeRleCodeLengths(
         run--;
       }
     }
-    i += (allLens[i] === len ? 0 : 0); // advance by original run
-    // Recompute advance cleanly:
     let adv = 1;
     while (i + adv < total && allLens[i + adv] === len) adv++;
     i += adv;
@@ -441,21 +439,18 @@ function buildMatchCache(data: Uint8Array, maxChain: number): MatchCache {
     }
 
     const limit = i - W_SIZE;
-    while (cur > limit && chain > 0) {
-      if (cur < rleSkip) {
-        chain--;
-        if (data[cur + bestLen] === data[i + bestLen] && data[cur] === data[i] && data[cur + 1] === data[i + 1]) {
-          let len = 2;
-          while (len < maxLen && data[cur + len] === data[i + len]) len++;
-          if (len > bestLen) {
-            ensureCap(1);
-            lengths[mCount] = len;
-            dists[mCount] = i - cur;
-            mCount++;
-            bestLen = len;
-            if (bestLen === maxLen) break;
-            if (bestLen >= 128 && chain > 64) chain = 64;
-          }
+    while (cur > limit && chain-- > 0) {
+      if (cur < rleSkip && data[cur + bestLen] === data[i + bestLen] && data[cur] === data[i] && data[cur + 1] === data[i + 1]) {
+        let len = 2;
+        while (len < maxLen && data[cur + len] === data[i + len]) len++;
+        if (len > bestLen) {
+          ensureCap(1);
+          lengths[mCount] = len;
+          dists[mCount] = i - cur;
+          mCount++;
+          bestLen = len;
+          if (bestLen === maxLen) break;
+          if (bestLen >= 64 && chain > 32) chain = 32;
         }
       }
       cur = prev[cur & W_MASK];
@@ -543,7 +538,7 @@ function optimalParseRange(
       const d = cache.dists[m];
       const dSym = DIST_SYM[d];
       const dCost = distCost[dSym] + DIST_EXTRA[dSym];
-      const limitShort = maxL < 24 ? maxL : 24;
+      const limitShort = maxL < 16 ? maxL : 16;
       for (let l = prevL + 1; l <= limitShort; l++) {
         const lSym = LEN_SYM[l];
         const mc = c + litCost[lSym] + LEN_EXTRA[lSym - 257] + dCost;
@@ -553,7 +548,7 @@ function optimalParseRange(
           bestDist[rel + l] = d;
         }
       }
-      if (maxL > 24) {
+      if (maxL > 16) {
         for (let ci = 0; ci < CHECKPOINTS.length; ci++) {
           const l = CHECKPOINTS[ci];
           if (l > prevL && l < maxL - 1) {
@@ -566,7 +561,7 @@ function optimalParseRange(
             }
           }
         }
-        if (maxL - 1 > prevL && maxL - 1 > 24) {
+        if (maxL - 1 > prevL && maxL - 1 > 16) {
           const l = maxL - 1;
           const lSym = LEN_SYM[l];
           const mc = c + litCost[lSym] + LEN_EXTRA[lSym - 257] + dCost;
@@ -810,7 +805,7 @@ export function zopfliDeflateZlib(data: Uint8Array, iterations?: number, maxChai
   }
 
   const iters = iterations ?? (data.length > 2_000_000 ? 1 : 2);
-  const chain = maxChain ?? (data.length > 2_800_000 ? 384 : 512);
+  const chain = maxChain ?? (data.length > 2_000_000 ? 128 : 256);
   const cache = buildMatchCache(data, chain);
   let curTokens = greedyInitialTokens(data, cache);
   let bestBytes = encodeSplitBlocksZlib(data, cache, curTokens, 0);
@@ -818,7 +813,7 @@ export function zopfliDeflateZlib(data: Uint8Array, iterations?: number, maxChai
   for (let it = 0; it < iters; it++) {
     const { litCost, distCost } = tokensToCostModel(curTokens);
     const nextTokens = optimalParsePass(data, cache, litCost, distCost);
-    const blockIters = it === iters - 1 ? 3 : 0;
+    const blockIters = it === iters - 1 ? 1 : 0;
     const nextBytes = encodeSplitBlocksZlib(data, cache, nextTokens, blockIters);
     if (nextBytes.length < bestBytes.length) {
       bestBytes = nextBytes;
